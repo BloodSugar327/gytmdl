@@ -6,7 +6,6 @@ import logging
 import shutil
 from enum import Enum
 from pathlib import Path
-
 import click
 
 from . import __version__
@@ -16,7 +15,6 @@ from .enums import CoverFormat, DownloadMode
 
 downloader_sig = inspect.signature(Downloader.__init__)
 
-
 def get_param_string(param: click.Parameter) -> str:
     if isinstance(param.default, Enum):
         return param.default.value
@@ -24,7 +22,6 @@ def get_param_string(param: click.Parameter) -> str:
         return str(param.default)
     else:
         return param.default
-
 
 def write_default_config_file(ctx: click.Context):
     ctx.params["config_path"].parent.mkdir(parents=True, exist_ok=True)
@@ -34,7 +31,6 @@ def write_default_config_file(ctx: click.Context):
         if param.name not in EXCLUDED_CONFIG_FILE_PARAMS
     }
     ctx.params["config_path"].write_text(json.dumps(config_file, indent=4))
-
 
 def load_config_file(
     ctx: click.Context,
@@ -55,15 +51,35 @@ def load_config_file(
             ctx.params[param.name] = param.type_cast_value(ctx, config_file[param.name])
     return ctx
 
+def save_progress(progress_path: Path, current_url_index: int, current_track_index: int):
+    with open(progress_path, "w") as f:
+        json.dump({
+            "current_url_index": current_url_index,
+            "current_track_index": current_track_index
+        }, f)
+
+def load_progress(progress_path: Path):
+    if progress_path.exists():
+        with open(progress_path, "r") as f:
+            return json.load(f)
+    return {"current_url_index": 0, "current_track_index": 0}
+
+def format_formats(formats: list[dict], best_format: dict) -> str:
+    format_strings = []
+    for fmt in formats:
+        format_info = f"{fmt['ext'].upper()} ({fmt['abr']} kbps)"
+        if best_format and fmt == best_format:
+            format_info = f"\033[92m{format_info}\033[0m"  # Highlight the best format
+        format_strings.append(format_info)
+    return ", ".join(format_strings)
 
 @click.command()
 @click.help_option("-h", "--help")
 @click.version_option(__version__, "-v", "--version")
-# CLI specific options
 @click.argument(
-    "urls",
+    "url_sources",
     nargs=-1,
-    type=str,
+    type=click.Path(exists=True),
     required=True,
 )
 @click.option(
@@ -100,7 +116,6 @@ def load_config_file(
     is_flag=True,
     help="Print exceptions.",
 )
-# Downloader specific options
 @click.option(
     "--output-path",
     "-o",
@@ -195,7 +210,6 @@ def load_config_file(
     default=downloader_sig.parameters["truncate"].default,
     help="Maximum length of the file/folder names.",
 )
-# This option should always be last
 @click.option(
     "--no-config-file",
     "-n",
@@ -203,10 +217,16 @@ def load_config_file(
     callback=load_config_file,
     help="Don't load the config file.",
 )
+@click.option(
+    "--progress-path",
+    type=Path,
+    default=Path.home() / ".gytmdl" / "progress.json",
+    help="Path to progress file.",
+)
 @click.version_option(__version__)
 @click.help_option("-h", "--help")
 def main(
-    urls: tuple[str],
+    url_sources: tuple[click.Path],
     save_cover: bool,
     overwrite: bool,
     read_urls_as_txt: bool,
@@ -229,6 +249,7 @@ def main(
     exclude_tags: str,
     truncate: int,
     no_config_file: bool,
+    progress_path: Path,
 ):
     logging.basicConfig(
         format="[%(levelname)-8s %(asctime)s] %(message)s",
@@ -236,6 +257,7 @@ def main(
     )
     logger = logging.getLogger(__name__)
     logger.setLevel(log_level)
+
     if not shutil.which(ffmpeg_path):
         logger.critical(X_NOT_FOUND_STRING.format("FFmpeg", ffmpeg_path))
         return
@@ -245,12 +267,30 @@ def main(
     if cookies_path and not cookies_path.exists():
         logger.critical(X_NOT_FOUND_STRING.format("Cookies file", cookies_path))
         return
-    if read_urls_as_txt:
-        _urls = []
-        for url in urls:
-            if Path(url).exists():
-                _urls.extend(Path(url).read_text().splitlines())
-        urls = _urls
+
+    # Load progress
+    progress = load_progress(progress_path)
+    current_url_index = progress["current_url_index"]
+    current_track_index = progress["current_track_index"]
+
+    urls = []
+    for url_source in url_sources:
+        if Path(url_source).is_file():
+            with open(url_source) as f:
+                urls.extend(line.strip() for line in f if line.strip())
+        else:
+            urls.append(url_source)
+
+    # Prompt to resume or start over
+    if current_url_index > 0 and click.confirm(
+        f"Resume from saved progress (URL index {current_url_index+1}, Track index {current_track_index})? Press 'Y' to resume, 'N' to start over."
+    ):
+        urls = urls[current_url_index-1:]
+    else:
+        # Start over
+        current_url_index = 0
+        current_track_index = 0
+
     logger.debug("Starting downloader")
     downloader = Downloader(
         output_path,
@@ -270,67 +310,93 @@ def main(
         truncate,
     )
     error_count = 0
-    download_queue = []
-    for url_index, url in enumerate(urls, start=1):
-        url_progress = f"URL {url_index}/{len(urls)}"
+
+    for url_index, url in enumerate(urls, start=current_url_index):
+        url_progress = f"URL {url_index+1}/{len(urls)}"
         try:
             logger.info(f'({url_progress}) Checking "{url}"')
             download_queue = list(downloader.get_download_queue(url))
         except Exception as e:
             error_count += 1
-            logger.error(
-                f'({url_progress}) Failed to check "{url}"',
-                exc_info=print_exceptions,
-            )
+            logger.error(f'({url_progress}) Failed to check "{url}"', exc_info=print_exceptions)
             continue
-    for queue_index, queue_item in enumerate(download_queue, start=1):
-        queue_progress = f"Track {queue_index}/{len(download_queue)} from URL {url_index}/{len(urls)}"
-        try:
-            logger.info(f'({queue_progress}) Downloading "{queue_item["title"]}"')
-            logger.debug("Getting tags")
-            ytmusic_watch_playlist = downloader.get_ytmusic_watch_playlist(
-                queue_item["id"]
-            )
-            if not ytmusic_watch_playlist:
-                logger.warning(
-                    f"({queue_progress}) Track doesn't have an album or is not available, skipping"
+
+        for queue_index, queue_item in enumerate(download_queue, start=1):
+            if current_url_index == url_index and queue_index <= current_track_index:
+                continue  # Skip already processed tracks
+
+            queue_progress = f"{url_progress} - Track {queue_index}/{len(download_queue)} "
+            try:
+                logger.info(f'({queue_progress}) Downloading "{queue_item["title"]}"')
+                logger.debug("Getting tags")
+                ytmusic_watch_playlist = downloader.get_ytmusic_watch_playlist(queue_item["id"])
+                if not ytmusic_watch_playlist:
+                    logger.warning(
+                        f"({queue_progress}) Track doesn't have an album or is not available, skipping"
+                    )
+                    continue
+                video_id = ytmusic_watch_playlist["tracks"][0]["videoId"]
+                formats = downloader.get_available_formats(video_id)
+                valid_formats = [f for f in formats if f.get("abr") and int(f["abr"]) > 0]
+                opus_formats = [f for f in valid_formats if f["acodec"] == "opus"]
+                best_format = None
+                if opus_formats:
+                    best_format = max(opus_formats, key=lambda f: int(f["abr"]))
+                else:
+                    best_format = max(valid_formats, key=lambda f: int(f["abr"]), default=None)
+
+                formats_log = format_formats(valid_formats, best_format)
+                logger.info(f"({queue_progress}) Available formats: {formats_log}")
+
+                if best_format:
+                    itag = best_format["format_id"]
+                else:
+                    logger.error(f"({queue_progress}) No suitable formats found for download.")
+                    continue
+                tags = downloader.get_tags(ytmusic_watch_playlist)
+                logger.info(f"Is track explicit? {tags.get("explicit")}")
+                track_temp_path = downloader.get_track_temp_path(video_id)
+                remuxed_path = downloader.get_remuxed_path(video_id)
+                final_path = downloader.get_final_path(tags)
+                cover_url = downloader.get_cover_url(ytmusic_watch_playlist)
+                cover_path = downloader.get_cover_path(final_path)
+                if final_path.exists() and not overwrite:
+                    logger.warning(
+                        f'({queue_progress}) Song already exists at "{final_path}", skipping'
+                    )
+                else:
+                    logger.debug(f'Downloading to "{track_temp_path}"')
+                    downloader.download(video_id, track_temp_path)
+                    logger.debug(f'Remuxing to "{remuxed_path}"')
+                    downloader.remux(track_temp_path, remuxed_path)
+                    logger.debug("Applying tags")
+                    downloader.apply_tags(remuxed_path, tags, cover_url)
+                    logger.debug(f'Moving to "{final_path}"')
+                    downloader.move_to_output_path(remuxed_path, final_path)
+                if not save_cover:
+                    pass
+                elif cover_path.exists() and not overwrite:
+                    logger.debug(f'Cover already exists at "{cover_path}", skipping')
+                else:
+                    logger.debug(f'Saving cover to "{cover_path}"')
+                    downloader.save_cover(cover_path, cover_url)
+            except Exception as e:
+                error_count += 1
+                logger.error(
+                    f'({queue_progress}) Failed to download "{queue_item["title"]}"',
+                    exc_info=print_exceptions,
                 )
-                continue
-            video_id = ytmusic_watch_playlist["tracks"][0]["videoId"]
-            tags = downloader.get_tags(ytmusic_watch_playlist)
-            track_temp_path = downloader.get_track_temp_path(video_id)
-            remuxed_path = downloader.get_remuxed_path(video_id)
-            final_path = downloader.get_final_path(tags)
-            cover_url = downloader.get_cover_url(ytmusic_watch_playlist)
-            cover_path = downloader.get_cover_path(final_path)
-            if final_path.exists() and not overwrite:
-                logger.warning(
-                    f'({queue_progress}) Song already exists at "{final_path}", skipping'
-                )
-            else:
-                logger.debug(f'Downloading to "{track_temp_path}"')
-                downloader.download(video_id, track_temp_path)
-                logger.debug(f'Remuxing to "{remuxed_path}"')
-                downloader.remux(track_temp_path, remuxed_path)
-                logger.debug("Applying tags")
-                downloader.apply_tags(remuxed_path, tags, cover_url)
-                logger.debug(f'Moving to "{final_path}"')
-                downloader.move_to_output_path(remuxed_path, final_path)
-            if not save_cover:
-                pass
-            elif cover_path.exists() and not overwrite:
-                logger.debug(f'Cover already exists at "{cover_path}", skipping')
-            else:
-                logger.debug(f'Saving cover to "{cover_path}"')
-                downloader.save_cover(cover_path, cover_url)
-        except Exception as e:
-            error_count += 1
-            logger.error(
-                f'({queue_progress}) Failed to download "{queue_item["title"]}"',
-                exc_info=print_exceptions,
-            )
-        finally:
-            if temp_path.exists():
-                logger.debug(f'Cleaning up "{temp_path}"')
-                downloader.cleanup_temp_path()
+            finally:
+                if temp_path.exists():
+                    logger.debug(f'Cleaning up "{temp_path}"')
+                    downloader.cleanup_temp_path()
+            
+            # Update progress after each track
+            save_progress(progress_path, url_index, queue_index)
+
+        # Update progress after each URL
+        current_url_index = url_index
+        current_track_index = 0
+        save_progress(progress_path, current_url_index, current_track_index)
+
     logger.info(f"Done ({error_count} error(s))")
