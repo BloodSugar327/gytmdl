@@ -194,6 +194,31 @@ class Downloader:
     def _get_datetime_obj(date: str) -> datetime.datetime:
         return datetime.datetime.strptime(date, "%Y")
 
+    def get_available_formats(self, video_id: str) -> list[dict]:
+        """Fetches available formats for a given YouTube video ID.
+
+        Args:
+            video_id: The YouTube video ID.
+
+        Returns:
+            A list of dictionaries, each representing an available format.
+        """
+        with YoutubeDL(self.ytdlp_options) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            formats = info.get("formats", [])
+
+            # Optionally filter formats here if needed
+            # For example, to get only audio formats:
+            # formats = [f for f in formats if f.get('acodec') != 'none']
+
+            # # Filter out zero bitrate formats
+            # formats = [fmt for fmt in formats if fmt.get('abr', 0) > 0]  
+
+            # # Sort formats by bitrate (highest to lowest)
+            # formats.sort(key=lambda fmt: int(fmt.get('abr', 0)), reverse=True)
+
+            return formats
+
     def get_tags(self, ytmusic_watch_playlist: dict) -> dict:
         video_id = ytmusic_watch_playlist["tracks"][0]["videoId"]
         ytmusic_album = self.get_ytmusic_album(
@@ -216,8 +241,10 @@ class Downloader:
             if entry["id"] == video_id:
                 if ytmusic_album["tracks"][index]["isExplicit"]:
                     tags["rating"] = 1
+                    tags["explicit"] = True
                 else:
                     tags["rating"] = 0
+                    tags["explicit"] = False
                 tags["track"] = index + 1
                 break
         if ytmusic_watch_playlist["lyrics"]:
